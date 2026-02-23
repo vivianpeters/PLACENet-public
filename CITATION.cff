@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+author:
+- family-names: "Peters"
+  given-names: "Vivian"
+  orcid: "https://orcid.org/0009-0009-6572-6164"
+title: "Software Implementation for: Neural-network–enabled passive localization of multiple gamma emitters in radioactive waste"
+version: 1.0.0
+date-released: 2026-02-23
+url: "https://github.com/vivianpeters/PLACENet-public"
