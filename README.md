@@ -3,6 +3,8 @@ PLACENet - Passive Localization of Active materials in shielded Containers Enabl
 
 CNN-based model for multi-source detection and 3D bounding box regression from spectral data, with "boxes + confidence"-style output and optional hybrid loss (smooth L1 + CIoU) with greedy or Jonker–Volgenant matching.
 
+The source code and sample data are archived on Zenodo: [![DOI](https://zenodo.org/badge/1164606150.svg)](https://doi.org/10.5281/zenodo.18743642)
+
 ## Repository structure
 
 ```
