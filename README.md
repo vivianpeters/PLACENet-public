@@ -11,11 +11,11 @@ CNN-based model for multi-source detection and 3D bounding box regression from s
 ├── requirements.txt
 ├── LICENSE
 ├── PLACENet/                # Python package
-│   ├── __init__.py
-│   ├── PLACENet_prep.py     # Data loading and preparation
-│   ├── PLACENet_model.py    # Model and training
-│   └── PLACENet_evaluate.py # Evaluation and plotting
-└── sample_dataset/         # Optional: example data to try the pipeline
+   ├── __init__.py
+   ├── PLACENet_prep.py     # Data loading and preparation
+   ├── PLACENet_model.py    # Model and training
+   └── PLACENet_evaluate.py # Evaluation and plotting
+
 ```
 
 ## Requirements
@@ -48,7 +48,7 @@ If you use the provided **sample_dataset/** folder, point `data_root` to it (or 
    data_root = Path("/path/to/your/data/directory")
    ```
 
-   Use the path to the folder containing your `*_gamma_detector_energy_data*` and `*_gamma_position_arrays*` files, or the path to `sample_dataset` if you use the included sample.
+   Use the path to the folder containing your `*_gamma_detector_energy_data*` and `*_gamma_position_arrays*` files.
 
 2. **Run from the repository root** (the directory that contains `run_PLACENet.py` and the `PLACENet` folder):
 
