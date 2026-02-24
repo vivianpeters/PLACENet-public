@@ -6,6 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
+import gc
+import json
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -888,7 +893,7 @@ class PLACENetCore:
 
             # Save loss curve for this fold
             try:
-                from .PLACENet_plot import PLACENetPlot
+                from .PLACENet_evaluate import PLACENetPlot
                 PLACENetPlot.save_loss_curves(
                     [history],
                     results_dir / f"loss_curves_{file_label}_kf{kfold}.pdf"
