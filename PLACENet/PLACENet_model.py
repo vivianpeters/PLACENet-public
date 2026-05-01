@@ -3,17 +3,16 @@
 # Supports greedy or JV (Jonker-Volgenant) matching
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
-
 import gc
-import json
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import json
 from sklearn.model_selection import KFold
 from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.utils import register_keras_serializable
@@ -105,6 +104,7 @@ def _pairwise_smooth_l1_batch(y_true, y_pred, delta=1.0):
     per_elem = tf.where(mask_quad, quad, linear)
     per_box = tf.reduce_sum(per_elem, axis=-1)  # (B, S, S)
     return per_box
+
 
 # ============================================================================
 # Spectrum augmentation functions
@@ -810,6 +810,54 @@ class PLACENetCore:
         model.compile(optimizer=opt, loss=loss_fn, metrics=[], jit_compile=False)
         return model
 
+    @staticmethod
+    def _build_augmenter(config: PLACENetConfig) -> Optional[PLACESpectrumAugmenter]:
+        """Create an augmenter from config, or None when disabled."""
+        if not config.enable_augmentation or config.augmentation_multiplier <= 0:
+            return None
+        kwargs = {
+            "poisson_noise": True,
+            "energy_shift": True,
+            "intensity_scale": False,
+            "detector_dropout": True,
+            "energy_shift_range": 0.02,
+            "intensity_scale_range": (0.8, 1.2),
+            "detector_dropout_prob": 0.1,
+            "poisson_scale": 500.0,
+        }
+        kwargs.update(config.augmenter_kwargs)
+        return PLACESpectrumAugmenter(**kwargs)
+
+    @staticmethod
+    def _augment_train_fold(
+        train_data: np.ndarray,
+        train_labels: np.ndarray,
+        config: PLACENetConfig,
+        augmenter: Optional[PLACESpectrumAugmenter],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Augment train-fold only to avoid train/validation leakage."""
+        if augmenter is None:
+            return train_data, train_labels
+
+        augmented_batches = [train_data]
+        augmented_labels = [train_labels]
+        original_size = len(train_data)
+        for _ in range(config.augmentation_multiplier):
+            augmented_batches.append(augmenter.augment_batch(train_data))
+            augmented_labels.append(train_labels)
+
+        train_data_aug = np.concatenate(augmented_batches, axis=0)
+        train_labels_aug = np.concatenate(augmented_labels, axis=0)
+        permutation = np.random.permutation(len(train_data_aug))
+        train_data_aug = train_data_aug[permutation]
+        train_labels_aug = train_labels_aug[permutation]
+
+        print(
+            f"Augmented train-fold size: {len(train_data_aug)} samples "
+            f"(from {original_size}, multiplier {config.augmentation_multiplier + 1}x)"
+        )
+        return train_data_aug, train_labels_aug
+
     def do_kfold(
         self,
         data: np.ndarray,
@@ -830,12 +878,13 @@ class PLACENetCore:
             metrics_summary: List of metric dictionaries per fold
             history_list: List of training histories per fold
         """
-        callback = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=30)
+        callback = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=30, restore_best_weights=True)
         history_list = []
         metrics_summary = []
         file_label = config.run_name if config.run_name else label
         results_dir = Path(f"Results_{file_label}")
         results_dir.mkdir(parents=True, exist_ok=True)
+        augmenter = self._build_augmenter(config)
 
         for kfold, (train, test) in enumerate(KFold(n_splits=config.folds, shuffle=True, random_state=42).split(data, labels)):
             tf.keras.backend.clear_session()
@@ -849,8 +898,17 @@ class PLACENetCore:
             np.random.seed(42) # Set the random seed to 42 to compare when different models are trained on the same data
             tf.random.set_seed(42) # Set the random seed to 42 to compare when different models are trained on the same data
 
+            train_data_fold = data[train]
+            train_labels_fold = labels[train]
+            train_data_fold, train_labels_fold = self._augment_train_fold(
+                train_data_fold,
+                train_labels_fold,
+                config,
+                augmenter,
+            )
+
             # Prepare labels: add confidence for YOLO-style
-            train_labels_prep = self.add_confidence_to_labels(labels[train], pad_value=self.PAD_VALUE)
+            train_labels_prep = self.add_confidence_to_labels(train_labels_fold, pad_value=self.PAD_VALUE)
             test_labels_prep = self.add_confidence_to_labels(labels[test], pad_value=self.PAD_VALUE)
             
             # Infer input shape from data
@@ -876,7 +934,7 @@ class PLACENetCore:
 
             # Train the model and save the history
             history = model.fit(
-                data[train], train_labels_prep,
+                train_data_fold, train_labels_prep,
                 epochs=config.epochs,
                 batch_size=config.batch_size,
                 callbacks=[callback, tensorboard_callback],
@@ -937,41 +995,6 @@ class PLACENet:
     
     def __init__(self, config: PLACENetConfig):
         self.config = config
-        self._augmenter = self._build_augmenter()
-    
-    def _build_augmenter(self) -> Optional[PLACESpectrumAugmenter]:
-        if not self.config.enable_augmentation or self.config.augmentation_multiplier <= 0:
-            return None
-        kwargs = {
-            "poisson_noise": True,
-            "energy_shift": True,
-            "intensity_scale": False,
-            "detector_dropout": True,
-            "energy_shift_range": 0.02,
-            "intensity_scale_range": (0.8, 1.2),
-            "detector_dropout_prob": 0.1,
-            "poisson_scale": 500.0,
-        }
-        kwargs.update(self.config.augmenter_kwargs)
-        return PLACESpectrumAugmenter(**kwargs)
-    
-    def _maybe_augment(self, data: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Augment the data and labels if the augmenter is not None."""
-        if self._augmenter is None: # If the augmenter is None, return the data and labels
-            return data, labels
-        augmented_batches = [data]
-        augmented_labels = [labels]
-        original_size = len(data)
-        for _ in range(self.config.augmentation_multiplier):
-            augmented_batches.append(self._augmenter.augment_batch(data))
-            augmented_labels.append(labels)
-        data = np.concatenate(augmented_batches, axis=0)
-        labels = np.concatenate(augmented_labels, axis=0)
-        permutation = np.random.permutation(len(data))
-        data = data[permutation]
-        labels = labels[permutation]
-        print(f"Augmented dataset size: {len(data)} samples (from {original_size}, multiplier {self.config.augmentation_multiplier + 1}x)")
-        return data, labels
 
     def train_concatenated(
         self,
@@ -980,7 +1003,6 @@ class PLACENet:
     ) -> PLACENetTrainingResult:
         """Train on concatenated datasets."""
         data, labels = self._concatenate(datasets)
-        data, labels = self._maybe_augment(data, labels)
         label = run_label or self.config.run_name or "run"
         metrics, histories = self._run_training(data, labels, label, run_name=self.config.run_name or label)
         return PLACENetTrainingResult(label, metrics, histories)
@@ -995,7 +1017,6 @@ class PLACENet:
         for idx, dataset in enumerate(datasets):
             label = (run_labels[idx % len(run_labels)] if run_labels else dataset.name)
             data, labels = self._align(dataset.data, dataset.labels)
-            data, labels = self._maybe_augment(data, labels)
             metrics, histories = self._run_training(data, labels, label, run_name=self.config.run_name or label)
             results.append(PLACENetTrainingResult(
                 run_label=label,
