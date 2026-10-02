@@ -193,64 +193,6 @@ class PLACENetCustomLoss:
         """Compute masked IoU metric."""
         return 1.0 - self.masked_iou_loss(y_true, y_pred)
 
-    def masked_iou_loss(self, y_true, y_pred):
-        """Compute masked IoU *loss* (1 - IoU).
-        Input format: [xwidth, xcentre, ywidth, ycentre, zwidth, zcentre]
-        """
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        # Extract only box dimensions (first 6) if using YOLO-style (7 dims)
-        y_true_boxes = y_true[..., :6]
-        y_pred_boxes = y_pred[..., :6]
-        mask = tf.not_equal(y_true_boxes, self.PAD_VALUE)
-        mask = tf.cast(mask, dtype=tf.float32)
-        y_true_masked = y_true_boxes * mask
-        y_pred_masked = y_pred_boxes * mask
-        x_width_true, x_centre_true, y_width_true, y_centre_true, z_width_true, z_centre_true = tf.unstack(y_true_masked, axis=-1)
-        x_width_pred, x_centre_pred, y_width_pred, y_centre_pred, z_width_pred, z_centre_pred = tf.unstack(y_pred_masked, axis=-1)
-        # Convert from centre-based to min/max for IoU calculation
-        x_min_true = x_centre_true - x_width_true / 2.0
-        x_max_true = x_centre_true + x_width_true / 2.0
-        y_min_true = y_centre_true - y_width_true / 2.0
-        y_max_true = y_centre_true + y_width_true / 2.0
-        z_min_true = z_centre_true - z_width_true / 2.0
-        z_max_true = z_centre_true + z_width_true / 2.0
-        x_min_pred = x_centre_pred - x_width_pred / 2.0
-        x_max_pred = x_centre_pred + x_width_pred / 2.0
-        y_min_pred = y_centre_pred - y_width_pred / 2.0
-        y_max_pred = y_centre_pred + y_width_pred / 2.0
-        z_min_pred = z_centre_pred - z_width_pred / 2.0
-        z_max_pred = z_centre_pred + z_width_pred / 2.0
-        x_intersect_min = tf.maximum(x_min_true, x_min_pred)
-        x_intersect_max = tf.minimum(x_max_true, x_max_pred)
-        y_intersect_min = tf.maximum(y_min_true, y_min_pred)
-        y_intersect_max = tf.minimum(y_max_true, y_max_pred)
-        z_intersect_min = tf.maximum(z_min_true, z_min_pred)
-        z_intersect_max = tf.minimum(z_max_true, z_max_pred)
-        intersection = tf.maximum(x_intersect_max - x_intersect_min, 0) * tf.maximum(y_intersect_max - y_intersect_min, 0) * tf.maximum(z_intersect_max - z_intersect_min, 0)
-        true_volume = tf.abs(x_width_true) * tf.abs(y_width_true) * tf.abs(z_width_true)
-        pred_volume = tf.abs(x_width_pred) * tf.abs(y_width_pred) * tf.abs(z_width_pred)
-        union = true_volume + pred_volume - intersection + 1e-7
-        iou = intersection / union
-        
-        # Only average over valid (non-padded) boxes
-        # mask has shape (..., max_sources, 6), check if all 6 dims are non-pad
-        valid_box_mask = tf.reduce_all(mask > 0.5, axis=-1)  # Shape: (..., max_sources)
-        valid_box_mask = tf.cast(valid_box_mask, dtype=tf.float32)
-        
-        # Compute mean IoU only over valid boxes
-        iou_masked = iou * valid_box_mask
-        sum_iou = tf.reduce_sum(iou_masked)
-        count_valid = tf.reduce_sum(valid_box_mask)
-        mean_iou = tf.cond(
-            count_valid > 0,
-            lambda: sum_iou / count_valid,
-            lambda: 0.0
-        )
-        
-        return 1.0 - mean_iou
-
-
 def _pairwise_ciou3d_batch(y_true, y_pred, pad_value=-1, eps=_EPS):
     """Compute pairwise CIoU3D *costs* for batch.
     Input format: [xwidth, xcentre, ywidth, ycentre, zwidth, zcentre]
@@ -259,8 +201,8 @@ def _pairwise_ciou3d_batch(y_true, y_pred, pad_value=-1, eps=_EPS):
     pad_val = tf.cast(pad_value, y_true.dtype)
     
     # Check if boxes are padded (all 6 dimensions equal pad_value)
-    true_is_padded = tf.reduce_all(tf.equal(y_true, pad_val), axis=-1)  # (B, S)
-    pred_is_padded = tf.reduce_all(tf.equal(y_pred, pad_val), axis=-1)  # (B, S)
+    true_is_padded = tf.reduce_all(tf.abs(y_true - pad_val) < 1e-3, axis=-1)  # (B, S)
+    pred_is_padded = tf.reduce_all(tf.abs(y_pred - pad_val) < 1e-3, axis=-1)  # (B, S)
     
     T = _abs_gt_widths(y_true)
     P = _ensure_positive_widths(y_pred)
@@ -411,9 +353,10 @@ class YOLOStyleMatchingLoss(tf.keras.losses.Loss):
         confidence_weight: float = 1.5, # Weight for the confidence loss
         noobj_weight: float = 0.1, # Weight for the no object loss
         name: str = "yolo_style_matching_loss", # Name of the loss since Keras needs a name
+        reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE, 
         **kwargs,
     ):
-        super().__init__(name=name, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE, **kwargs)
+        super().__init__(name=name, reduction=reduction, **kwargs)
         assert base in ("smooth_l1", "ciou", "hybrid")
         assert matching_strategy in ("greedy", "jv")
         self.base = base
@@ -533,7 +476,7 @@ class YOLOStyleMatchingLoss(tf.keras.losses.Loss):
         
         return indices, counts
 
-    def _jv_tf_batch(self, cost_batch):
+    def _jv_tf_batch(self, cost_batch, match_cost=None):
         """
         Batch-wise JV matching that maintains gradient flow.
         Uses numpy for matching but gathers from TensorFlow tensor for gradients.
@@ -541,10 +484,13 @@ class YOLOStyleMatchingLoss(tf.keras.losses.Loss):
         B = tf.shape(cost_batch)[0]
         S = self.max_sources
         
+        if match_cost is None:
+            match_cost = cost_batch
+            
         # Get indices from numpy JV (non-differentiable)
         indices_np, counts_np = tf.numpy_function(
             self._jv_numpy_batch_indices,
-            [cost_batch],
+            [match_cost],
             [tf.int32, tf.int32]
         )
         indices_np.set_shape((None, S, 3))
@@ -575,52 +521,112 @@ class YOLOStyleMatchingLoss(tf.keras.losses.Loss):
             (sample_indices, indices_np, counts_np),
             fn_output_signature=tf.TensorSpec(shape=(), dtype=tf.float32)
         )
-        
-        return mean_costs
+        # Return indices and counts alongside the mean cost to allow confidence target assignment
+        return mean_costs, indices_np, counts_np
     
-    def _greedy_tf_batch(self, cost_batch, n_true, n_pred):
+    def _greedy_tf_batch(self, cost_batch, match_cost=None):
         """Batch-wise greedy matching algorithm."""
         B = tf.shape(cost_batch)[0]
         S = self.max_sources
         inf = tf.constant(1e10, dtype=cost_batch.dtype)
-        cost = tf.identity(cost_batch)
-        total = tf.zeros((B,), dtype=cost.dtype)
+        
+        if match_cost is None:
+            match_cost = cost_batch
+            
+        cost_for_matching = tf.identity(match_cost)
+        total = tf.zeros((B,), dtype=cost_batch.dtype)
         counts = tf.zeros((B,), dtype=tf.int32)
+        indices = tf.zeros((B, S, 3), dtype=tf.int32) # tracks per-step (batch, pred, gt) assignment indices
 
-        def cond(step, cost, total, counts):
+        def cond(step, cost, total, counts, indices):
             return tf.less(step, S)
 
-        def body(step, cost, total, counts):
-            flat = tf.reshape(cost, (B, -1))
+        def body(step, cost_for_matching, total, counts, indices):
+            flat = tf.reshape(cost_for_matching, (B, -1))
             argmin = tf.argmin(flat, axis=1, output_type=tf.int32)
             i = argmin // S
             j = argmin % S
             idx = tf.stack([tf.range(B, dtype=tf.int32), i, j], axis=1)
-            chosen = tf.gather_nd(cost, idx)
-            chosen = tf.where(tf.math.is_finite(chosen) & (chosen < 1e9), chosen, 0.0)
+            
+            # Gather from original cost_batch for the loss, but from cost_for_matching to check validity
+            chosen = tf.gather_nd(cost_batch, idx)
+            chosen_matching_cost = tf.gather_nd(cost_for_matching, idx)
+            
+            chosen = tf.where(tf.math.is_finite(chosen_matching_cost) & (chosen_matching_cost < 1e9), chosen, 0.0)
             total = total + chosen
-            counts = counts + tf.where(tf.math.is_finite(chosen) & (chosen < 1e9), 1, 0)
+            counts = counts + tf.where(tf.math.is_finite(chosen_matching_cost) & (chosen_matching_cost < 1e9), 1, 0)
             
             row_mask = tf.tensor_scatter_nd_update(
-                tf.zeros((B, S), dtype=cost.dtype),
+                tf.zeros((B, S), dtype=cost_for_matching.dtype),
                 tf.stack([tf.range(B, dtype=tf.int32), i], axis=1),
-                tf.ones((B,), dtype=cost.dtype) * inf
+                tf.ones((B,), dtype=cost_for_matching.dtype) * inf
             )
             col_mask = tf.tensor_scatter_nd_update(
-                tf.zeros((B, S), dtype=cost.dtype),
+                tf.zeros((B, S), dtype=cost_for_matching.dtype),
                 tf.stack([tf.range(B, dtype=tf.int32), j], axis=1),
-                tf.ones((B,), dtype=cost.dtype) * inf
+                tf.ones((B,), dtype=cost_for_matching.dtype) * inf
             )
-            cost = cost + tf.expand_dims(row_mask, 2) + tf.expand_dims(col_mask, 1)
-            return step + 1, cost, total, counts
+            cost_for_matching = cost_for_matching + tf.expand_dims(row_mask, 2) + tf.expand_dims(col_mask, 1)
+
+            # Record the (batch, pred_slot, gt_slot) assignment for this step
+            indices = tf.tensor_scatter_nd_update(
+                indices,
+                tf.stack([tf.range(B, dtype=tf.int32), tf.fill((B,), step)], axis=1),
+                tf.stack([tf.range(B, dtype=tf.int32), i, j], axis=1)
+            )
+            return step + 1, cost_for_matching, total, counts, indices
 
         step0 = tf.constant(0, dtype=tf.int32)
-        _, cost_fin, total_fin, counts_fin = tf.while_loop(
-            cond, body, (step0, cost, total, counts), maximum_iterations=S
+        _, cost_fin, total_fin, counts_fin, indices_fin = tf.while_loop(
+            cond, body,
+            loop_vars=[step0, cost_for_matching, total, counts, indices],
+            maximum_iterations=S
         )
-        counts_fin = tf.cast(counts_fin, cost_fin.dtype)
-        mean_vals = tf.where(counts_fin > 0, total_fin / counts_fin, tf.zeros_like(total_fin))
-        return mean_vals
+        counts_float = tf.cast(counts_fin, cost_fin.dtype) # counts_fin is int, must use float for division below
+        mean_costs = tf.where(counts_float > 0, total_fin / counts_float, tf.zeros_like(total_fin))
+        return mean_costs, indices_fin, counts_fin
+
+    # Assign GT confidence targets to prediction slots based on the bipartite matching.
+    def _match_conf_tf(self, conf_true, indices, counts):
+        """
+        Construct matched confidence targets (B,S) based on dynamic matching indices.
+        Prediction slot k matched to GT row j inherits conf_true[b,j].
+        Unmatched prediction slots remain 0.
+        Args:
+            conf_true: (B,S) batch of confidence targets
+            indices_np: (B,S,3) numpy array of matching indices
+            counts_np: (B,) array of number of valid matches per sample
+        Returns:
+            matched_conf: (B,S) tensor of matched confidence targets
+        """
+        B = tf.shape(conf_true)[0]
+        S = self.max_sources
+
+        def per_sample_target(args):
+            """Build matched confidence targets for one sample"""
+            sample_idx, sample_matches, count = args # sample_matches (renamed from sample_indices) contains [batch_idx, row, col], count is the number of valid matches
+            valid_indices = sample_matches[:count] # take the first 'count' valid matches
+            
+            def no_matches():
+                return tf.zeros((S,), dtype=tf.float32) # if no matches, return zeros
+            
+            def has_matches():
+                gt_rows = valid_indices[:, 1] # GT indices
+                pred_cols = valid_indices[:, 2] # pred indices
+                gt_conf_vals = tf.gather(conf_true[sample_idx], gt_rows) # take the GT confidence values
+                scatter_idx = tf.expand_dims(pred_cols, axis=-1) # expand the prediction indices to be used for scatter_nd
+                return tf.scatter_nd(scatter_idx, gt_conf_vals, shape=(S,)) # scatter the GT confidence values into the prediction slots
+            
+            return tf.cond(tf.equal(count, 0), no_matches, has_matches) # if count is 0, return zeros, otherwise return the matched confidence values
+        
+        batch_indices = tf.range(B, dtype=tf.int32) # renamed to avoid confusion with sample_indices
+        matched_conf = tf.map_fn(
+            per_sample_target,
+            (batch_indices, indices, counts),
+            fn_output_signature=tf.TensorSpec(shape=(S,), dtype=tf.float32)
+        ) # map over each sample to get the matched confidence values
+
+        return matched_conf
 
     def call(self, y_true, y_pred):
         """
@@ -640,9 +646,9 @@ class YOLOStyleMatchingLoss(tf.keras.losses.Loss):
         boxes_true, conf_true = self._split_outputs(y_true)
         boxes_pred, conf_pred = self._split_outputs(y_pred)
 
-        # Compute valid masks
-        true_mask = tf.logical_not(tf.reduce_all(tf.equal(boxes_true, pad_val), axis=-1))
-        pred_mask = tf.logical_not(tf.reduce_all(tf.equal(boxes_pred, pad_val), axis=-1))
+        # Compute valid masks (with tolerance)
+        true_mask = tf.logical_not(tf.reduce_all(tf.abs(boxes_true - pad_val) < 1e-3, axis=-1))
+        pred_mask = tf.logical_not(tf.reduce_all(tf.abs(boxes_pred - pad_val) < 1e-3, axis=-1))
 
         boxes_t_clip = boxes_true[:, :S, :]
         boxes_p_clip = boxes_pred[:, :S, :]
@@ -658,34 +664,42 @@ class YOLOStyleMatchingLoss(tf.keras.losses.Loss):
         else:
             cost_ciou = tf.zeros((B, S, S), dtype=tf.float32)
 
-        cost = self.smooth_weight * cost_smooth + self.ciou_weight * cost_ciou # Combine the smooth L1 and CIoU costs
-        cost = self._mask_costs(cost, true_mask, pred_mask) # Mask the costs for the valid pairs
+        cost_pure = self.smooth_weight * cost_smooth + self.ciou_weight * cost_ciou 
+        
+        # Include predicted confidence in the matching cost (Higher confidence = Lower cost)
+        cost_scale = tf.stop_gradient(tf.reduce_mean(cost_pure) + 1.0)
+        conf_penalty = tf.expand_dims(conf_pred, axis=1) # (B, 1, S)
+        true_mask_float = tf.cast(tf.expand_dims(true_mask, axis=2), tf.float32) # (B, S, 1)
+        match_cost = cost_pure - (cost_scale * self.confidence_weight * conf_penalty * true_mask_float)
+        
+        match_cost = self._mask_costs(match_cost, true_mask, pred_mask)
 
         # Check for valid pairs
         any_true = tf.reduce_any(true_mask, axis=1)
         any_pred = tf.reduce_any(pred_mask, axis=1)
         any_pair = tf.logical_and(any_true, any_pred)
 
+        # Run bipartite matching; retrieve both indices and counts for downstream confidence target assignment
         # Box matching loss
         if self.matching_strategy == "greedy":
-            box_loss_per_sample = self._greedy_tf_batch(
-                cost,
-                tf.reduce_sum(tf.cast(true_mask, tf.int32), axis=1),
-                tf.reduce_sum(tf.cast(pred_mask, tf.int32), axis=1)
-            )
+            box_loss_per_sample, match_indices, match_counts = self._greedy_tf_batch(cost_pure, match_cost)
         else:  # jv
-            box_loss_per_sample = self._jv_tf_batch(cost)
+            box_loss_per_sample, match_indices, match_counts = self._jv_tf_batch(cost_pure, match_cost)
 
         box_loss_per_sample = tf.where(any_pair, box_loss_per_sample, tf.zeros_like(box_loss_per_sample))
 
         # Confidence loss
-        confidence_loss = self._confidence_loss(conf_true, conf_pred)
+        # Assign GT confidence targets to the prediction slots determined by the box matching
+        matched_conf = self._match_conf_tf(conf_true, match_indices, match_counts)
+        confidence_loss = self._confidence_loss(matched_conf, conf_pred)
+        box_loss_mean = tf.reduce_mean(box_loss_per_sample)
 
         # Combine losses
         total_loss = tf.reduce_mean(box_loss_per_sample) + self.confidence_weight * confidence_loss
         
         total_loss = tf.where(tf.math.is_finite(total_loss), total_loss, tf.constant(0.0, dtype=total_loss.dtype))
         return total_loss
+
 
 
 # ============================================================================
@@ -721,7 +735,7 @@ class PLACENetCore:
         # Add confidence: 1.0 for valid slots, 0.0 for empty slots
         for i in range(N):
             for j in range(S):
-                is_valid = not np.all(labels[i, j] == pad_value)
+                is_valid = not np.all(np.isclose(labels[i, j], pad_value, atol=1e-3))
                 labels_with_conf[i, j, 6] = 1.0 if is_valid else 0.0
         
         return labels_with_conf
@@ -803,7 +817,7 @@ class PLACENetCore:
             confidence_weight=config.confidence_weight,
             noobj_weight=config.noobj_weight,
         )
-        
+
         print(f"[make_CNN_model] Created YOLO-style CNN with matching={config.matching_strategy}, base={config.loss_type}")
 
         opt = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)

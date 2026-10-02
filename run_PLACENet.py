@@ -1,12 +1,7 @@
 """
 Example script showing how to run the PLACENet pipeline.
 """
-
-import glob
-import re
 from pathlib import Path
-
-import numpy as np
 
 from PLACENet import (
     PLACENet,
@@ -21,7 +16,7 @@ from PLACENet.PLACENet_evaluate import evaluate_run
 # ---------------------------------------------------------------------------
 # 1) Configure and load datasets
 # ---------------------------------------------------------------------------
-data_root = Path("/path/to/data/directory")
+data_root = Path("/path/to/your/csv/data")
 
 prep = PLACENetPrep( # Prepare the datasets
     PLACEPrepConfig(
@@ -30,7 +25,7 @@ prep = PLACENetPrep( # Prepare the datasets
         chunk_size=16, # Number of spectra to group together
         pad_value=-1,
         max_sources=3, # Maximum number of sources to classify
-        cluster_eps=2.0,
+        cluster_eps=1.7,
         randomize_slot_assignment=True, # If True, randomize the slot assignment
     )
 )
@@ -53,13 +48,13 @@ trainer = PLACENet( # Train the model
         epochs=3000,
         batch_size=32,
         folds=5,
-        run_name="run_name_of_choice",
+        run_name="final_jv_eps1p7_smooth1p0_ciou1p0_conf1p5_noobj2p0",
         max_sources=3,
         delta=1.0, # for smooth_l1 loss
         ciou_weight=1.0, # weight for CIoU cost in hybrid box matching cost
-        smooth_weight=0.1, # weight for smooth L1 cost in hybrid box matching cost
+        smooth_weight=1.0, # weight for smooth L1 cost in hybrid box matching cost
         confidence_weight=1.5, # scale confidence loss compared to box loss
-        noobj_weight=0.1, # scale class imbalance for confidence loss
+        noobj_weight=2.0, # scale class imbalance for confidence loss
         enable_augmentation=True,
         augmentation_multiplier=5,
     )
@@ -77,11 +72,14 @@ file_label = trainer.config.run_name or result.run_label
 # ---------------------------------------------------------------------------
 # 3) Evaluate model on held-out test set
 # ---------------------------------------------------------------------------
-evaluate_run(trainer.config.max_sources, res_dir, file_label)
+evaluate_run(trainer.config.max_sources, res_dir, file_label, cost_metric="hybrid", delta=1.0, smooth_weight=1.0, ciou_weight=1.0)
 
 # ---------------------------------------------------------------------------
 # 4) Optional plotting example
 # ---------------------------------------------------------------------------
 
-plotter = PLACENetPlot(PLACEPlotConfig(binx=32, biny=32, binz=72))
-plotter.compare_histo(res_dir, file_label, model_suffix="", sample_idx=42, binx=102, biny=102, binz=72)
+plotter = PLACENetPlot(PLACEPlotConfig(binx=102, biny=102, binz=72))
+
+# Set sample_idx to any valid index from your test set to visualise a specific sample.
+sample_idx = 0
+plotter.compare_histo(res_dir, file_label, model_suffix="", sample_idx=sample_idx, binx=102, biny=102, binz=72)

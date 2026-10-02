@@ -43,7 +43,8 @@ def compute_iou_per_slot_stats(y_true, y_pred, pad_value=-1):
     if y_pred.shape[-1] == 7:
         y_pred = y_pred[..., :6]
     # Valid slot = all 6 dims non-pad
-    valid = np.all(y_true != pad_value, axis=-1)
+    # Use float tolerance to robustly exclude padded slots (confidence is excluded from pad check)
+    valid = ~np.all(np.isclose(y_true[..., :6], pad_value, atol=1e-3), axis=-1)
     # Centre/width -> min/max
     xw_t, xc_t, yw_t, yc_t, zw_t, zc_t = y_true[..., 0], y_true[..., 1], y_true[..., 2], y_true[..., 3], y_true[..., 4], y_true[..., 5]
     xw_p, xc_p, yw_p, yc_p, zw_p, zc_p = y_pred[..., 0], y_pred[..., 1], y_pred[..., 2], y_pred[..., 3], y_pred[..., 4], y_pred[..., 5]
@@ -112,8 +113,16 @@ def extract_boxes_from_yolo_output(y_pred, confidence_threshold=0.5, pad_value=-
         confidences: (batch, max_sources) - confidence scores
     """
     if y_pred.shape[-1] == 7:
+        # UN-NORMALIZE PREDICTIONS! The network outputs coordinates in [0, 1].
+        # We must scale them back to the original grid dimensions [102, 102, 72]
+        # if the maximum predicted coordinate is <= 1.05 (indicating it's normalized).
+        y_pred_boxes = y_pred[..., :6].copy()
+        if np.max(y_pred_boxes[y_pred_boxes != pad_value]) <= 1.05:
+            scales = np.array([102.0, 102.0, 102.0, 102.0, 72.0, 72.0])
+            y_pred_boxes = y_pred_boxes * scales
+            
         # YOLO-style output
-        boxes = y_pred[..., :6]  # (batch, max_sources, 6)
+        boxes = y_pred_boxes  # (batch, max_sources, 6)
         confidences = y_pred[..., 6]  # (batch, max_sources)
         
         # Filter by confidence: set boxes to pad_value if confidence < threshold
@@ -136,19 +145,82 @@ def _get_valid_boxes(y_true_b: np.ndarray, y_pred_b: np.ndarray, pad_value: floa
     Returns (true_valid_mask, pred_valid_mask, true_valid, pred_valid).
     true_valid has shape (n_true, 6), pred_valid has shape (n_pred, 6).
     """
-    true_valid_mask = ~np.all(y_true_b == pad_value, axis=-1)
-    pred_valid_mask = ~np.all(y_pred_b == pad_value, axis=-1)
+    # Use float tolerance to robustly exclude padded rows (slice to :6 so confidence is not treated as padding)
+    true_valid_mask = ~np.all(np.isclose(y_true_b[:, :6], pad_value, atol=1e-3), axis=-1)
+    pred_valid_mask = ~np.all(np.isclose(y_pred_b[:, :6], pad_value, atol=1e-3), axis=-1)
     true_valid = y_true_b[true_valid_mask]
     pred_valid = y_pred_b[pred_valid_mask]
     return true_valid_mask, pred_valid_mask, true_valid, pred_valid
 
+# Compute the per-pair box assignment cost using the same metric as the training loss,
+# so that evaluation matching is consistent with how the model was trained.
+def _compute_box_cost(
+    pred_box: np.ndarray,
+    true_box: np.ndarray,
+    cost_metric: str = "hybrid",
+    delta: float = 1.0,
+    smooth_weight: float = 1.0,
+    ciou_weight: float = 1.0,
+) -> float:
+    """Compute pair cost between 6D pred_box and true_box."""
+    if cost_metric == "l2":
+        return float(np.linalg.norm(pred_box[:6] - true_box[:6]))
+
+    xw_p, xc_p, yw_p, yc_p, zw_p, zc_p = pred_box[:6]
+    xw_t, xc_t, yw_t, yc_t, zw_t, zc_t = true_box[:6]
+
+    # 1. Smooth L1 cost
+    diff = np.abs(pred_box[:6] - true_box[:6])
+    smooth_l1_vals = np.where(diff < delta, 0.5 * (diff ** 2), delta * diff - 0.5 * (delta ** 2))
+    smooth_l1_cost = float(np.sum(smooth_l1_vals))
+    if cost_metric == "smooth_l1":
+        return smooth_l1_cost
+
+    # 2. 3D CIoU cost
+    x_min_t, x_max_t = xc_t - abs(xw_t)/2, xc_t + abs(xw_t)/2
+    y_min_t, y_max_t = yc_t - abs(yw_t)/2, yc_t + abs(yw_t)/2
+    z_min_t, z_max_t = zc_t - abs(zw_t)/2, zc_t + abs(zw_t)/2
+
+    x_min_p, x_max_p = xc_p - abs(xw_p)/2, xc_p + abs(xw_p)/2
+    y_min_p, y_max_p = yc_p - abs(yw_p)/2, yc_p + abs(yw_p)/2
+    z_min_p, z_max_p = zc_p - abs(zw_p)/2, zc_p + abs(zw_p)/2
+
+    inter = (
+        max(min(x_max_t, x_max_p) - max(x_min_t, x_min_p), 0) *
+        max(min(y_max_t, y_max_p) - max(y_min_t, y_min_p), 0) *
+        max(min(z_max_t, z_max_p) - max(z_min_t, z_min_p), 0)
+    )
+    vol_t = abs(xw_t) * abs(yw_t) * abs(zw_t)
+    vol_p = abs(xw_p) * abs(yw_p) * abs(zw_p)
+    union = vol_t + vol_p - inter + 1e-7
+    iou = inter / union
+
+    # Enclosing box
+    enc_x_min, enc_x_max = min(x_min_t, x_min_p), max(x_max_t, x_max_p)
+    enc_y_min, enc_y_max = min(y_min_t, y_min_p), max(y_max_t, y_max_p)
+    enc_z_min, enc_z_max = min(z_min_t, z_min_p), max(z_max_t, z_max_p)
+    c2 = (enc_x_max - enc_x_min)**2 + (enc_y_max - enc_y_min)**2 + (enc_z_max - enc_z_min)**2 + 1e-7
+
+    # Center distance
+    rho2 = (xc_p - xc_t)**2 + (yc_p - yc_t)**2 + (zc_p - zc_t)**2
+    ciou = iou - (rho2 / c2)
+    ciou_cost = float(1.0 - ciou)
+
+    if cost_metric == "ciou":
+        return ciou_cost
+
+    # Hybrid cost
+    return smooth_weight * smooth_l1_cost + ciou_weight * ciou_cost
+
+
 
 def _compute_box_assignment(
-    true_valid: np.ndarray, pred_valid: np.ndarray, matching_type: str = "greedy"
+    true_valid: np.ndarray, pred_valid: np.ndarray, matching_type: str = "greedy",
+    cost_metric: str = "hybrid", delta: float = 1.0, smooth_weight: float = 0.1, ciou_weight: float = 1.0
 ) -> List[tuple]:
     """
     Compute assignment of predicted boxes to ground truth boxes.
-    Cost = L2 distance between box vectors. Returns list of (pred_idx, true_idx).
+    Cost = L2 or Hybrid distance between box vectors. Returns list of (pred_idx, true_idx).
     """
     n_true = len(true_valid)
     n_pred = len(pred_valid)
@@ -158,7 +230,11 @@ def _compute_box_assignment(
     cost_matrix = np.zeros((n_pred, n_true))
     for i in range(n_pred):
         for j in range(n_true):
-            cost_matrix[i, j] = np.linalg.norm(pred_valid[i] - true_valid[j])
+            # Use the same cost metric as the training loss for consistent matching
+            cost_matrix[i, j] = _compute_box_cost(
+                pred_valid[i], true_valid[j], cost_metric=cost_metric,
+                delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
+            )
 
     if matching_type == "jv":
         # Square matrix for linear_sum_assignment
@@ -247,8 +323,8 @@ def _save_r2_scatter_plot(
     _plot_subset(axes[0], overall_truth, overall_pred, "#1f77b4", "Overall (all components)", r2_overall)
     _plot_subset(axes[1], widths_truth, widths_pred, "#ff7f0e", "Widths (xwidth, ywidth, zwidth)", r2_widths)
     _plot_subset(axes[2], positions_truth, positions_pred, "#2ca02c", "Positions (xcentre, ycentre, zcentre)", r2_positions)
-    fig.suptitle(suptitle, fontsize=20, fontweight="bold", y=0.98)
-    plt.subplots_adjust(left=0.08, right=0.98, top=0.82, wspace=0.25)
+    fig.suptitle(suptitle, fontsize=20, fontweight="bold", y=1.02)
+    plt.subplots_adjust(left=0.08, right=0.98, top=0.78, wspace=0.25)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     fig.savefig(output_path.with_suffix(".png"), dpi=150, bbox_inches="tight")
@@ -256,11 +332,80 @@ def _save_r2_scatter_plot(
     if verbose:
         print(f"Saved R² scatter plot to {output_path} and .png")
 
+#---------------------------------
+# Apply NEW generalized matching (BUGFIX!)
+#---------------------------------
+def apply_matching(
+    y_true, y_pred, pad_value=-1, matching_type="greedy", cost_metric="hybrid",
+    confidence_threshold=0.0, delta=1.0, smooth_weight=0.1, ciou_weight=1.0
+):
+    """
+    Apply generalized matching to predictions before evaluation. Ensures confidences retain the same matching as boxes!
+    
+    Args:
+        y_true: Ground truth boxes (batch, max_sources, 6) or (batch, max_sources, 7) if YOLO
+        y_pred: Predicted boxes (batch, max_sources, 6) or (batch, max_sources, 7) if YOLO
+        pad_value: Value used for padding (rows with all pad_value are ignored)
+        matching_type: "greedy" or "jv" (Jonker-Volgenant)
+        cost_metric: "l2", "smooth_l1", "ciou", or "hybrid"
+        confidence_threshold: If y_pred has 7 dims, filter by confidence
+    
+    Returns:
+        y_pred_matched: Predictions reordered to match ground truth (batch, max_sources, 6)
+    """
+    # Extract boxes and confidence if 7D
+    has_confidence = (y_pred.shape[-1] == 7)
+    if has_confidence:
+        boxes_pred, conf_pred = extract_boxes_from_yolo_output(y_pred, confidence_threshold, pad_value)
+    else:
+        boxes_pred = y_pred.copy()
+    if y_true.shape[-1] == 7:
+        boxes_true = y_true[..., :6]
+    else:
+        boxes_true = y_true
+    batch_size, max_sources, _ = boxes_true.shape
+    
+    # Initialize output array (7D if input had confidence, 6D otherwise)
+    if has_confidence:
+        y_pred_matched = np.full((batch_size, max_sources, 7), pad_value, dtype=y_pred.dtype)
+        y_pred_matched[..., 6] = 0.0  # default confidence = 0.0
+    else:
+        y_pred_matched = np.full((batch_size, max_sources, 6), pad_value, dtype=y_pred.dtype)
+    for b in range(batch_size):
+        true_valid_mask, pred_valid_mask, true_valid, pred_valid = _get_valid_boxes(
+            boxes_true[b], boxes_pred[b], pad_value
+        )
+        if len(true_valid) == 0 or len(pred_valid) == 0:
+            if len(true_valid) == 0:
+                y_pred_matched[b] = y_pred[b]
+            continue
+        # Compute matching pairs (handles both "greedy" and "jv")
+        matched_pairs = _compute_box_assignment(
+            true_valid, pred_valid, matching_type=matching_type, cost_metric=cost_metric,
+            delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
+        )
+        
+        used_pred_pos = set()
+        # 1. Place matched predictions (box + confidence atomic copy)
+        for pred_idx_valid, true_idx_valid in matched_pairs:
+            true_pos = np.where(true_valid_mask)[0][true_idx_valid]
+            pred_pos = np.where(pred_valid_mask)[0][pred_idx_valid]
+            y_pred_matched[b, true_pos] = y_pred[b, pred_pos]  # Copies full 7D tuple!
+            used_pred_pos.add(pred_pos)
+        # 2. Place leftover predictions into empty GT slots (box + confidence atomic copy)
+        empty_slots = [i for i in range(max_sources) if not true_valid_mask[i]]
+        unmatched_pred_positions = [i for i in range(max_sources) if pred_valid_mask[i] and i not in used_pred_pos]
+        for empty_slot, pred_pos in zip(empty_slots, unmatched_pred_positions):
+            y_pred_matched[b, empty_slot] = y_pred[b, pred_pos]  # Copies full 7D tuple!
+    return y_pred_matched
 
 # --------------------------------
 # Apply greedy matching
 # --------------------------------
-def apply_greedy_matching(y_true, y_pred, pad_value=-1, confidence_threshold=0.5):
+def apply_greedy_matching(
+    y_true, y_pred, pad_value=-1, confidence_threshold=0.5,
+    cost_metric="hybrid", delta=1.0, smooth_weight=0.1, ciou_weight=1.0
+):
     """
     Apply greedy matching to predictions before evaluation.
     Reorders predicted boxes to match ground truth box order using greedy algorithm.
@@ -276,41 +421,15 @@ def apply_greedy_matching(y_true, y_pred, pad_value=-1, confidence_threshold=0.5
     Returns:
         y_pred_matched: Predictions reordered to match ground truth (batch, max_sources, 6)
     """
-    # Handle YOLO-style output (extract boxes and filter by confidence)
-    if y_pred.shape[-1] == 7:
-        y_pred, _ = extract_boxes_from_yolo_output(y_pred, confidence_threshold, pad_value)
+    return apply_matching(y_true, y_pred, pad_value=pad_value, matching_type="greedy", confidence_threshold=confidence_threshold)
     
-    # Handle YOLO-style ground truth (extract boxes only)
-    if y_true.shape[-1] == 7:
-        y_true = y_true[..., :6]
-    
-    batch_size = y_true.shape[0]
-    max_sources = y_true.shape[1]
-    y_pred_matched = np.full_like(y_pred, pad_value)
-    
-    for b in range(batch_size):
-        true_valid_mask, pred_valid_mask, true_valid, pred_valid = _get_valid_boxes(
-            y_true[b], y_pred[b], pad_value
-        )
-        if len(true_valid) == 0:
-            y_pred_matched[b] = y_pred[b]
-            continue
-        if len(pred_valid) == 0:
-            continue
-        matched_pairs = _compute_box_assignment(true_valid, pred_valid, "greedy")
-        matched_pred = np.full((max_sources, 6), pad_value, dtype=y_pred.dtype)
-        for pred_idx, true_idx in matched_pairs:
-            true_pos = np.where(true_valid_mask)[0][true_idx]
-            matched_pred[true_pos] = pred_valid[pred_idx]
-        y_pred_matched[b] = matched_pred
-    
-    return y_pred_matched
-
-
 # --------------------------------
 # Apply JV matching
 # --------------------------------
-def apply_jv_matching(y_true, y_pred, pad_value=-1, confidence_threshold=0.5):
+def apply_jv_matching(
+    y_true, y_pred, pad_value=-1, confidence_threshold=0.5,
+    cost_metric="hybrid", delta=1.0, smooth_weight=0.1, ciou_weight=1.0
+):
     """
     Apply Jonker-Volgenant (JV) matching to predictions before evaluation.
     Reorders predicted boxes to match ground truth box order.
@@ -330,86 +449,108 @@ def apply_jv_matching(y_true, y_pred, pad_value=-1, confidence_threshold=0.5):
     Returns:
         y_pred_matched: Predictions reordered to match ground truth (batch, max_sources, 6)
     """
-    # Handle YOLO-style output (extract boxes and filter by confidence)
-    if y_pred.shape[-1] == 7:
-        y_pred, _ = extract_boxes_from_yolo_output(y_pred, confidence_threshold, pad_value)
-    
-    # Handle YOLO-style ground truth (extract boxes only)
-    if y_true.shape[-1] == 7:
-        y_true = y_true[..., :6]
-    
-    batch_size = y_true.shape[0]
-    max_sources = y_true.shape[1]
-    y_pred_matched = np.full_like(y_pred, pad_value)
-    
-    for b in range(batch_size):
-        true_valid_mask, pred_valid_mask, true_valid, pred_valid = _get_valid_boxes(
-            y_true[b], y_pred[b], pad_value
-        )
-        if len(true_valid) == 0:
-            y_pred_matched[b] = y_pred[b]
-            continue
-        if len(pred_valid) == 0:
-            continue
-        matched_pairs = _compute_box_assignment(true_valid, pred_valid, "jv")
-        matched_pred = np.full((max_sources, 6), pad_value, dtype=y_pred.dtype)
-        for pred_idx, true_idx in matched_pairs:
-            true_pos = np.where(true_valid_mask)[0][true_idx]
-            matched_pred[true_pos] = pred_valid[pred_idx]
-        y_pred_matched[b] = matched_pred
-    
-    return y_pred_matched
+    return apply_matching(y_true, y_pred, pad_value=pad_value, matching_type="jv", confidence_threshold=confidence_threshold)
 
 
 # --------------------------------
 # Match confidence scores
 # --------------------------------
-def match_confidence_scores(y_true, y_pred_boxes, pred_confidences, pad_value=-1, matching_type="greedy"):
+def match_confidence_scores(
+    y_true, y_pred_boxes, pred_confidences=None, pad_value=-1, matching_type="greedy",
+    cost_metric="hybrid", delta=1.0, smooth_weight=0.1, ciou_weight=1.0
+):
     """
     Match confidence scores to ground truth slots using the same matching as boxes.
-    NB: This is not the same as matching the confidence scores to the ground truth boxes.
-    Essentially, this is a copy of the box matching algorithm, but for the confidence scores.
-    If the confidence scores are not matched to the correct ground truth box, the loss will be incorrect.
-    Ensure that the same assignment is used for the confidence scores as for the boxes.
-    
-    Args:
-        y_true: Ground truth boxes (batch, max_sources, 6)
-        y_pred_boxes: Predicted boxes (batch, max_sources, 6) - should be UNMATCHED (raw predictions)
-        pred_confidences: Predicted confidence scores (batch, max_sources)
-        pad_value: Value used for padding
-        matching_type: "greedy" or "jv"
-    
-    Returns:
-        matched_confidences: Confidence scores reordered to match ground truth (batch, max_sources)
+    By setting confidence_threshold=0.0, we ensure that ALL predicted boxes are
+    matched to ground truth based purely on their coordinates, so we can see
+    what confidence score the model *actually* assigned to the correct boxes.
     """
-    if pred_confidences is None:
+    # Stack 6D boxes and 2D confidences into 7D if needed
+    if y_pred_boxes.shape[-1] == 7:
+        y_pred_7d = y_pred_boxes
+    elif pred_confidences is not None:
+        y_pred_7d = np.concatenate([y_pred_boxes, pred_confidences[..., np.newaxis]], axis=-1)
+    else:
         return None
     
-    batch_size = y_true.shape[0]
-    max_sources = y_true.shape[1]
-    matched_confidences = np.zeros_like(pred_confidences)
-    
-    for b in range(batch_size):
-        true_valid_mask, pred_valid_mask, true_valid, pred_valid = _get_valid_boxes(
-            y_true[b], y_pred_boxes[b], pad_value
-        )
-        pred_conf_valid = pred_confidences[b][pred_valid_mask]
-        if len(true_valid) == 0:
-            matched_confidences[b] = pred_confidences[b]
-            continue
-        if len(pred_valid) == 0:
-            continue
-        matched_pairs = _compute_box_assignment(true_valid, pred_valid, matching_type)
-        matched_conf = np.zeros(max_sources, dtype=pred_confidences.dtype)
-        for pred_idx, true_idx in matched_pairs:
-            true_pos = np.where(true_valid_mask)[0][true_idx]
-            matched_conf[true_pos] = pred_conf_valid[pred_idx]
-        matched_confidences[b] = matched_conf
-    
-    return matched_confidences
-
+    # Run unified 7D matching with threshold=0.0 so we match EVERYTHING
+    matched = apply_matching(
+        y_true, y_pred_7d, pad_value=pad_value, matching_type=matching_type, cost_metric=cost_metric,
+        confidence_threshold=0.0, delta=delta, smooth_weight=smooth_weight, ciou_weight=1.0
+    )
+    return matched[..., 6]
 
 # --------------------------------
+def compute_total_volume_iou(y_true, y_pred, binx=102, biny=102, binz=72, pad_value=-1):
+    """
+    Computes the total volume IoU for a batch of predictions vs truth.
+    Converts all predicted boxes and all true boxes into two 3D boolean grids
+    and computes the Intersection over Union of the grids.
+    """
+    batch_size = y_true.shape[0]
+    total_volume_ious = []
+    
+    for b in range(batch_size):
+        actual_hist = np.zeros((binx, biny, binz), dtype=np.int8)
+        prediction_hist = np.zeros((binx, biny, binz), dtype=np.int8)
+        
+        # Process predictions
+        for source_idx in range(y_pred.shape[1]):
+            source_bbox = y_pred[b, source_idx]
+            if np.all(np.isclose(source_bbox[:6], pad_value, atol=1e-3)):
+                continue
+            
+            xwidth, xcentre, ywidth, ycentre, zwidth, zcentre = source_bbox[:6]
+            xw, yw, zw = int(round(xwidth)), int(round(ywidth)), int(round(zwidth))
+            if xw <= 0 or yw <= 0 or zw <= 0: continue
+            
+            xmin = int(np.floor(xcentre - (xw - 1) / 2.0 + 0.5))
+            ymin = int(np.floor(ycentre - (yw - 1) / 2.0 + 0.5))
+            zmin = int(np.floor(zcentre - (zw - 1) / 2.0 + 0.5))
+            
+            xmax = xmin + xw - 1
+            ymax = ymin + yw - 1
+            zmax = zmin + zw - 1
+            
+            xmin, xmax = max(0, xmin), min(binx - 1, xmax)
+            ymin, ymax = max(0, ymin), min(biny - 1, ymax)
+            zmin, zmax = max(0, zmin), min(binz - 1, zmax)
+            
+            if xmin <= xmax and ymin <= ymax and zmin <= zmax:
+                prediction_hist[xmin:xmax+1, ymin:ymax+1, zmin:zmax+1] = 1
+                
+        # Process actuals
+        for source_idx in range(y_true.shape[1]):
+            source_bbox = y_true[b, source_idx]
+            if np.all(np.isclose(source_bbox[:6], pad_value, atol=1e-3)):
+                continue
+            
+            xwidth, xcentre, ywidth, ycentre, zwidth, zcentre = source_bbox[:6]
+            xw, yw, zw = int(round(xwidth)), int(round(ywidth)), int(round(zwidth))
+            if xw <= 0 or yw <= 0 or zw <= 0: continue
+            
+            xmin = int(np.floor(xcentre - (xw - 1) / 2.0 + 0.5))
+            ymin = int(np.floor(ycentre - (yw - 1) / 2.0 + 0.5))
+            zmin = int(np.floor(zcentre - (zw - 1) / 2.0 + 0.5))
+            
+            xmax = xmin + xw - 1
+            ymax = ymin + yw - 1
+            zmax = zmin + zw - 1
+            
+            xmin, xmax = max(0, xmin), min(binx - 1, xmax)
+            ymin, ymax = max(0, ymin), min(biny - 1, ymax)
+            zmin, zmax = max(0, zmin), min(binz - 1, zmax)
+            
+            if xmin <= xmax and ymin <= ymax and zmin <= zmax:
+                actual_hist[xmin:xmax+1, ymin:ymax+1, zmin:zmax+1] = 1
+                
+        intersection = np.sum((actual_hist > 0) & (prediction_hist > 0))
+        union = np.sum((actual_hist > 0) | (prediction_hist > 0))
+        total_volume_iou = float(intersection / union) if union > 0 else 0.0
+        total_volume_ious.append(total_volume_iou)
+        
+    return total_volume_ious
+
 # Evaluate single fold
 # --------------------------------
 def evaluate_single_fold(
@@ -420,6 +561,10 @@ def evaluate_single_fold(
     model_suffix: str = "",
     pad_value: int = -1,
     verbose: bool = True,
+    cost_metric: str = "hybrid",
+    delta: float = 1.0,
+    smooth_weight: float = 0.1,
+    ciou_weight: float = 1.0,
 ):
     """Evaluate a single fold and return metrics."""
     # Load test data
@@ -459,11 +604,27 @@ def evaluate_single_fold(
     else:
         labels_test = labels_test_raw
 
+    if np.max(labels_test[labels_test != pad_value]) <= 1.05:
+        scales = np.array([102.0, 102.0, 102.0, 102.0, 72.0, 72.0])
+        valid_mask = (labels_test != pad_value)
+        labels_test = np.where(valid_mask, labels_test * scales, pad_value)
+
     if verbose:
         print(f"Test labels shape (after extraction): {labels_test.shape}")
 
     # Load model without compiling
-    model = tf.keras.models.load_model(model_path, compile=False)
+    #model = tf.keras.models.load_model(model_path, compile=False)
+    # Load model without compiling (with fallback for loose-variable models)
+    try:
+        model = tf.keras.models.load_model(model_path, compile=False)
+    except Exception as e:
+        if verbose:
+            print(f"Standard load_model failed ({e}), rebuilding architecture and loading weights...")
+        from .PLACENet_model import PLACENetCore, PLACENetConfig
+        core = PLACENetCore(np.array([]), pad_value=pad_value)
+        dummy_config = PLACENetConfig(max_sources=max_sources)
+        model = core.make_CNN_model(np.array([]), dummy_config, input_shape=data_test.shape[1:])
+        model.load_weights(model_path, skip_mismatch=True)
 
     if verbose:
         print("Making predictions on test set...")
@@ -484,20 +645,27 @@ def evaluate_single_fold(
         print("\nApplying matching to predictions...")
     
     # Apply matching to predictions (it does both JV and Greedy)
-    pred_matched_jv = apply_jv_matching(labels_test, pred, pad_value=pad_value)
-    pred_matched_greedy = apply_greedy_matching(labels_test, pred, pad_value=pad_value)
+    pred_matched_jv = apply_jv_matching(
+        labels_test, pred, pad_value=pad_value, cost_metric=cost_metric,
+        delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
+    )
+    pred_matched_greedy = apply_greedy_matching(
+        labels_test, pred, pad_value=pad_value, cost_metric=cost_metric,
+        delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
+    )
     
     # Match confidence scores to ground truth slots using the same matching as boxes
-    # Set to greedy, ensure it matches the box matching
     pred_confidences_matched = None
     if pred_confidences is not None:
         pred_confidences_matched = match_confidence_scores(
-            labels_test, pred, pred_confidences, pad_value=pad_value, matching_type="greedy"
+            labels_test, pred_raw, None, pad_value=pad_value, matching_type="jv",
+            cost_metric=cost_metric, delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
         )
 
     # --------------------------------
     # IoU from predictions vs labels
     # --------------------------------
+    total_volume_ious = compute_total_volume_iou(labels_test, pred_matched_jv, pad_value=pad_value)
     iou_no_matching, iou_std_nm, iou_count_nm = compute_iou_per_slot_stats(labels_test, pred, pad_value=pad_value)
     iou_with_jv, iou_std_jv, iou_count_jv = compute_iou_per_slot_stats(labels_test, pred_matched_jv, pad_value=pad_value)
     iou_with_greedy, iou_std_gr, iou_count_greedy = compute_iou_per_slot_stats(labels_test, pred_matched_greedy, pad_value=pad_value)
@@ -510,9 +678,10 @@ def evaluate_single_fold(
     pred_matched_jv_flat = pred_matched_jv.reshape(pred_matched_jv.shape[0], -1)
     pred_matched_greedy_flat = pred_matched_greedy.reshape(pred_matched_greedy.shape[0], -1)
 
-    mask_no_pad = (truth_flat != pad_value) & (pred_flat != pad_value)
-    mask_jv = (truth_flat != pad_value) & (pred_matched_jv_flat != pad_value)
-    mask_greedy = (truth_flat != pad_value) & (pred_matched_greedy_flat != pad_value)
+    # Use float tolerance to avoid false matches on padded slots
+    mask_no_pad = ~np.isclose(truth_flat, pad_value, atol=1e-3) & ~np.isclose(pred_flat, pad_value, atol=1e-3)
+    mask_jv = ~np.isclose(truth_flat, pad_value, atol=1e-3) & ~np.isclose(pred_matched_jv_flat, pad_value, atol=1e-3)
+    mask_greedy = ~np.isclose(truth_flat, pad_value, atol=1e-3) & ~np.isclose(pred_matched_greedy_flat, pad_value, atol=1e-3)
     
     # R² on valid slots only
     r2_no_matching = r2_score(truth_flat[mask_no_pad], pred_flat[mask_no_pad]) if np.any(mask_no_pad) else np.nan
@@ -527,7 +696,8 @@ def evaluate_single_fold(
     # Per-dimension R² (Greedy)
     per_dim_results = []
     for i in range(min(max_sources * 6, truth_flat.shape[1])):
-        mask = (truth_flat[:, i] != pad_value) & (pred_matched_greedy_flat[:, i] != pad_value)
+        # Use float tolerance to robustly exclude padded dimensions
+        mask = ~np.isclose(truth_flat[:, i], pad_value, atol=1e-3) & ~np.isclose(pred_matched_greedy_flat[:, i], pad_value, atol=1e-3)
         if np.sum(mask) > 0:
             r2_dim = r2_score(truth_flat[mask, i], pred_matched_greedy_flat[mask, i])
         else:
@@ -537,7 +707,8 @@ def evaluate_single_fold(
     # Per-dimension R² (JV)
     per_dim_results_jv = []
     for i in range(min(max_sources * 6, truth_flat.shape[1])):
-        mask = (truth_flat[:, i] != pad_value) & (pred_matched_jv_flat[:, i] != pad_value)
+        # Use float tolerance to robustly exclude padded dimensions
+        mask = ~np.isclose(truth_flat[:, i], pad_value, atol=1e-3) & ~np.isclose(pred_matched_jv_flat[:, i], pad_value, atol=1e-3)
         if np.sum(mask) > 0:
             r2_dim = r2_score(truth_flat[mask, i], pred_matched_jv_flat[mask, i])
         else:
@@ -556,12 +727,14 @@ def evaluate_single_fold(
     widths_pred_jv = []
     
     for idx in width_indices:
-        mask = (truth_flat[:, idx] != pad_value) & (pred_matched_greedy_flat[:, idx] != pad_value)
+        # Use float tolerance to robustly exclude padded dimensions
+        mask = ~np.isclose(truth_flat[:, idx], pad_value, atol=1e-3) & ~np.isclose(pred_matched_greedy_flat[:, idx], pad_value, atol=1e-3)
         if np.any(mask):
             widths_truth_greedy.extend(truth_flat[mask, idx])
             widths_pred_greedy.extend(pred_matched_greedy_flat[mask, idx])
         
-        mask_j = (truth_flat[:, idx] != pad_value) & (pred_matched_jv_flat[:, idx] != pad_value)
+        # Use float tolerance to robustly exclude padded dimensions
+        mask_j = ~np.isclose(truth_flat[:, idx], pad_value, atol=1e-3) & ~np.isclose(pred_matched_jv_flat[:, idx], pad_value, atol=1e-3)
         if np.any(mask_j):
             widths_truth_jv.extend(truth_flat[mask_j, idx])
             widths_pred_jv.extend(pred_matched_jv_flat[mask_j, idx])
@@ -576,12 +749,14 @@ def evaluate_single_fold(
     positions_pred_jv = []
     
     for idx in position_indices:
-        mask = (truth_flat[:, idx] != pad_value) & (pred_matched_greedy_flat[:, idx] != pad_value)
+        # Use float tolerance to robustly exclude padded dimensions
+        mask = ~np.isclose(truth_flat[:, idx], pad_value, atol=1e-3) & ~np.isclose(pred_matched_greedy_flat[:, idx], pad_value, atol=1e-3)
         if np.any(mask):
             positions_truth_greedy.extend(truth_flat[mask, idx])
             positions_pred_greedy.extend(pred_matched_greedy_flat[mask, idx])
         
-        mask_j = (truth_flat[:, idx] != pad_value) & (pred_matched_jv_flat[:, idx] != pad_value)
+        # Use float tolerance to robustly exclude padded dimensions
+        mask_j = ~np.isclose(truth_flat[:, idx], pad_value, atol=1e-3) & ~np.isclose(pred_matched_jv_flat[:, idx], pad_value, atol=1e-3)
         if np.any(mask_j):
             positions_truth_jv.extend(truth_flat[mask_j, idx])
             positions_pred_jv.extend(pred_matched_jv_flat[mask_j, idx])
@@ -606,7 +781,7 @@ def evaluate_single_fold(
             widths_truth_arr, widths_pred_arr,
             positions_truth_arr, positions_pred_arr,
             r2_with_greedy, r2_widths_greedy, r2_positions_greedy,
-            f"Truth vs Prediction (Greedy matching) - Fold {kfold_str}",
+            f"Truth vs Prediction - Fold {kfold_str}",
             verbose=verbose,
         )
     except Exception as e:
@@ -619,10 +794,13 @@ def evaluate_single_fold(
     # Calculate source count metrics
     def count_valid_sources(boxes, pad_value=-1):
         """Count number of valid (non-padded) sources in each sample."""
+        if boxes.shape[-1] == 7:
+            return np.sum(boxes[..., 6] >= 0.5, axis=-1)
+        
         batch_size = boxes.shape[0]
         counts = []
         for b in range(batch_size):
-            valid_mask = ~np.all(boxes[b] == pad_value, axis=-1)
+            valid_mask = ~np.all(np.isclose(boxes[b, ..., :6], pad_value, atol=1e-3), axis=-1)
             counts.append(np.sum(valid_mask))
         return np.array(counts)
     
@@ -736,15 +914,18 @@ def evaluate_single_fold(
         print(f"        If some classes are rare, macro can be lower than weighted.")
     
     # Empty slot prediction accuracy
-    def empty_slot_accuracy(true_boxes, pred_boxes, pad_value=-1):
-        """Calculate accuracy of predicting pad_value for empty slots."""
-        batch_size = true_boxes.shape[0]
+    def empty_slot_accuracy(y_true, y_pred, pad_value=-1):
+        """Calculate accuracy of predicting empty slots."""
+        batch_size = y_true.shape[0]
         empty_slot_correct = []
         for b in range(batch_size):
-            true_empty_mask = np.all(true_boxes[b] == pad_value, axis=-1)
-            if np.any(true_empty_mask):
-                pred_empty_slots = pred_boxes[b][true_empty_mask]
-                pred_is_pad = np.all(pred_empty_slots == pad_value, axis=-1)
+            true_empty = np.all(np.isclose(y_true[b, ..., :6], pad_value, atol=1e-3), axis=-1)
+            if np.any(true_empty):
+                pred_empty_slots = y_pred[b][true_empty]
+                if pred_empty_slots.shape[-1] == 7:
+                    pred_is_pad = pred_empty_slots[..., 6] < 0.5
+                else:
+                    pred_is_pad = np.all(np.isclose(pred_empty_slots[..., :6], pad_value, atol=1e-3), axis=-1)
                 empty_slot_correct.append(np.mean(pred_is_pad))
         return np.mean(empty_slot_correct) if empty_slot_correct else np.nan
     
@@ -823,7 +1004,7 @@ def evaluate_single_fold(
         true_confidences = np.zeros((labels_test.shape[0], labels_test.shape[1]), dtype=np.float32)
         for b in range(labels_test.shape[0]):
             for s in range(labels_test.shape[1]):
-                is_valid = not np.all(labels_test[b, s] == pad_value)
+                is_valid = not np.all(np.isclose(labels_test[b, s, :6], pad_value, atol=1e-3))
                 true_confidences[b, s] = 1.0 if is_valid else 0.0
         
         # Binary classification metrics for confidence
@@ -1035,6 +1216,7 @@ def evaluate_single_fold(
         'pred_source_counts_no_matching': pred_source_counts_no_matching.tolist(),
         'pred_source_counts_jv': pred_source_counts_jv.tolist(),
         'pred_source_counts_greedy': pred_source_counts_greedy.tolist(),
+        'total_volume_ious': total_volume_ious,
         **confidence_metrics,
     }
 
@@ -1047,6 +1229,10 @@ def evaluate_run(
     file_label: str,
     model_suffix: str = "",
     log_name: str = "r2_scores.log",
+    cost_metric: str = "hybrid",
+    delta: float = 1.0,
+    smooth_weight: float = 0.1,
+    ciou_weight: float = 1.0,
 ):
     """Evaluate saved models on their corresponding test splits and print metrics for all folds."""
     suffix_display = model_suffix or ""
@@ -1088,6 +1274,10 @@ def evaluate_run(
             file_label=file_label,
             kfold_str=kfold_str,
             model_suffix=model_suffix,
+            cost_metric=cost_metric,
+            delta=delta,
+            smooth_weight=smooth_weight,
+            ciou_weight=ciou_weight,
             pad_value=pad_value,
             verbose=True,
         )
@@ -1270,6 +1460,14 @@ def evaluate_run(
     
     source_count_mean_error_greedy_all = [r['source_count_mean_error_greedy'] for r in all_results if not np.isnan(r['source_count_mean_error_greedy'])]
     source_count_mean_error_jv_all = [r['source_count_mean_error_jv'] for r in all_results if not np.isnan(r['source_count_mean_error_jv'])]
+
+    # Aggregate Total Volume IoU
+    all_total_volume_ious = []
+    all_true_counts_for_iou = []
+    for r in all_results:
+        if 'total_volume_ious' in r and 'true_source_counts' in r:
+            all_total_volume_ious.extend(r['total_volume_ious'])
+            all_true_counts_for_iou.extend(r['true_source_counts'])
     source_count_mean_error_no_matching_all = [r['source_count_mean_error_no_matching'] for r in all_results if not np.isnan(r['source_count_mean_error_no_matching'])]
     
     empty_slot_acc_greedy_all = [r['empty_slot_accuracy_greedy'] for r in all_results if not np.isnan(r['empty_slot_accuracy_greedy'])]
@@ -1621,6 +1819,17 @@ def evaluate_run(
             r2_file.write(f"  JV matching:        Mean={np.mean(iou_jv_all):.4f}, Std(across folds)={np.std(iou_jv_all):.4f}\n")
             r2_file.write(f"  No matching:        Mean={np.mean(iou_no_matching_all):.4f}, Std(across folds)={np.std(iou_no_matching_all):.4f}\n")
         
+        # Total Volume IoU metrics
+        if all_total_volume_ious and all_true_counts_for_iou:
+            r2_file.write("\nTotal Volume IoU Metrics (JV matching):\n")
+            r2_file.write(f"  Overall Mean: {np.mean(all_total_volume_ious):.4f} ± {np.std(all_total_volume_ious):.4f} (N={len(all_total_volume_ious)})\n")
+            arr_iou = np.array(all_total_volume_ious)
+            arr_counts = np.array(all_true_counts_for_iou)
+            for sc in sorted(np.unique(arr_counts)):
+                if sc > 0:
+                    mask = (arr_counts == sc)
+                    r2_file.write(f"  {int(sc)}-source Mean: {np.mean(arr_iou[mask]):.4f} ± {np.std(arr_iou[mask]):.4f} (N={np.sum(mask)})\n")
+        
         # Source count metrics
         r2_file.write("\nSource Count Accuracy:\n")
         if source_count_accuracy_greedy_all:
@@ -1911,21 +2120,35 @@ def evaluate_run(
             if not model_path.exists():
                 continue
             
-            model = tf.keras.models.load_model(model_path, compile=False)
+            try:
+                model = tf.keras.models.load_model(model_path, compile=False)
+            except Exception as e:
+                from .PLACENet_model import PLACENetCore, PLACENetConfig
+                core = PLACENetCore(np.array([]), pad_value=pad_value)
+                dummy_config = PLACENetConfig(max_sources=max_sources)
+                model = core.make_CNN_model(np.array([]), dummy_config, input_shape=data_test.shape[1:])
+                model.load_weights(model_path, skip_mismatch=True)
+
             pred_raw = model.predict(data_test, verbose=0)
             
             # Extract boxes from YOLO-style output if needed
             pred, pred_conf = extract_boxes_from_yolo_output(pred_raw, confidence_threshold=0.5, pad_value=pad_value)
             
             # Apply matching
-            pred_matched_jv = apply_jv_matching(labels_test, pred, pad_value=pad_value)
-            pred_matched_greedy = apply_greedy_matching(labels_test, pred, pad_value=pad_value)
+            pred_matched_jv = apply_jv_matching(
+                labels_test, pred, pad_value=pad_value, cost_metric=cost_metric,
+                delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
+            )
+            pred_matched_greedy = apply_greedy_matching(
+                labels_test, pred, pad_value=pad_value, cost_metric=cost_metric,
+                delta=delta, smooth_weight=smooth_weight, ciou_weight=ciou_weight
+            )
             
-            # Match confidence scores to ground truth slots (use greedy matching for consistency)
+            # Match confidence scores to ground truth slots
             pred_conf_matched = None
             if pred_conf is not None:
                 pred_conf_matched = match_confidence_scores(
-                    labels_test, pred, pred_conf, pad_value=pad_value, matching_type="greedy"
+                    labels_test, pred_raw, None, pad_value=pad_value, matching_type="jv"
                 )
             
             # Collect MATCHED confidence scores if available
@@ -1935,7 +2158,7 @@ def evaluate_run(
                 true_conf = np.zeros_like(pred_conf_matched, dtype=np.float32)
                 for b in range(labels_test.shape[0]):
                     for s in range(labels_test.shape[1]):
-                        is_valid = not np.all(labels_test[b, s] == pad_value)
+                        is_valid = not np.all(np.isclose(labels_test[b, s, :6], pad_value, atol=1e-3))
                         true_conf[b, s] = 1.0 if is_valid else 0.0
                 all_true_confidences.extend(true_conf.flatten())
             
@@ -2030,7 +2253,7 @@ def evaluate_run(
                 w_truth, w_pred = all_widths_truth_jv, all_widths_pred_jv
                 p_truth, p_pred = all_positions_truth_jv, all_positions_pred_jv
                 r2_o, r2_w, r2_p = r2_overall_jv, r2_widths_jv, r2_positions_jv
-                suptitle = "Truth vs Prediction (JV matching) - All Folds Combined"
+                suptitle = "Truth vs Prediction - All Folds Combined"
             scatter_path = res_dir / f"r2_scatter_{file_label}_all_folds_{matching_type}.pdf"
             _save_r2_scatter_plot(
                 scatter_path, o_truth, o_pred, w_truth, w_pred, p_truth, p_pred,
@@ -2235,6 +2458,56 @@ def evaluate_run(
                 f'Source Count Confusion Matrix (Greedy Matching) - All Folds Combined',
                 cm_path_greedy
             )
+            
+            # Generate IoU and Position Error by Source Count plots
+            try:
+                iou_by_source_count_jv = []
+                total_volume_iou_by_source_count = []
+                
+                # Combine total volume ious across all folds
+                all_total_volume_ious = np.concatenate([r.get('total_volume_ious', []) for r in all_results])
+                pos_error_by_source_count_jv = []
+                valid_true_counts = []
+                
+                # Re-concatenate labels_test because all_labels was overwritten as class labels above
+                all_test_labels = np.concatenate([r['labels_test'] for r in all_results], axis=0)
+                
+                for true_count, y_true_b, y_pred_b, t_vol_iou in zip(all_true_counts, all_test_labels, all_pred_jv, all_total_volume_ious):
+                    if true_count == 0:
+                        continue
+                        
+                    # Calculate mean IoU for this sample
+                    m_iou, _, _ = compute_iou_per_slot_stats(y_true_b[np.newaxis, ...], y_pred_b[np.newaxis, ...], pad_value=-1)
+                    if not np.isnan(m_iou):
+                        # valid mask
+                        true_valid_mask = ~np.all(np.isclose(y_true_b[..., :6], -1, atol=1e-3), axis=-1)
+                        y_true_valid = y_true_b[true_valid_mask][..., :6]
+                        y_pred_valid = y_pred_b[true_valid_mask][..., :6] 
+                        
+                        # Filter out padded predictions (false negatives) from position error calc
+                        # Only calculate error for pairs where BOTH true and pred are valid
+                        pred_valid_mask = ~np.all(np.isclose(y_pred_valid, -1, atol=1e-3), axis=-1)
+                        if np.any(pred_valid_mask):
+                            centers_true = y_true_valid[pred_valid_mask][:, [1, 3, 5]]
+                            centers_pred = y_pred_valid[pred_valid_mask][:, [1, 3, 5]]
+                            dist = np.mean(np.sqrt(np.sum((centers_true - centers_pred)**2, axis=-1)))
+                            
+                            iou_by_source_count_jv.append(m_iou)
+                            total_volume_iou_by_source_count.append(t_vol_iou)
+                            pos_error_by_source_count_jv.append(dist)
+                            valid_true_counts.append(true_count)
+
+                iou_path = res_dir / f"iou_by_source_count_{file_label}_all_folds_jv.pdf"
+                PLACENetPlot.plot_iou_by_source_count(valid_true_counts, iou_by_source_count_jv, iou_path)
+                
+                t_vol_iou_path = res_dir / f"total_volume_iou_by_source_count_{file_label}_all_folds.pdf"
+                PLACENetPlot.plot_iou_by_source_count(valid_true_counts, total_volume_iou_by_source_count, t_vol_iou_path, title="Total Volume IoU by Source Count")
+                
+                pos_path = res_dir / f"position_error_by_source_count_{file_label}_all_folds_jv.pdf"
+                PLACENetPlot.plot_position_error_by_source_count(valid_true_counts, pos_error_by_source_count_jv, pos_path)
+            except Exception as e:
+                print(f"Warning: Could not generate IoU/Position plots by source count: {e}")
+                
     except Exception as e:
         print(f"Warning: Could not generate combined confusion matrices: {e}")
         import traceback
@@ -2292,15 +2565,36 @@ class PLACENetPlot:
             data_test = npz_file["data"]
             labels_test = npz_file["labels"]
 
+        if np.max(labels_test[labels_test != -1]) <= 1.05:
+            scales = np.array([102.0, 102.0, 102.0, 102.0, 72.0, 72.0, 1.0])
+            valid_mask = (labels_test != -1)
+            # Only apply scale to the coordinate dims if it's 7 dims, or all 6 if 6 dims
+            if labels_test.shape[-1] == 7:
+                labels_test = np.where(valid_mask, labels_test * scales, -1)
+            else:
+                labels_test = np.where(valid_mask, labels_test * scales[:6], -1)
+
         if sample_idx >= len(data_test):
             raise ValueError(f"sample_idx {sample_idx} exceeds test set size {len(data_test)}")
 
         # Load model
         model_path = res_dir / f"model_{file_label}{model_suffix}_kf{kfold_str}.keras"
         if not model_path.exists():
-            raise FileNotFoundError(f"Model not found: {model_path}")
+            existing_models = sorted(glob.glob(str(res_dir / f"model_{file_label}*_kf*.keras")))
+            if existing_models:
+                model_path = Path(existing_models[0])
+            else:
+                print(f"Warning: No model file found in {res_dir} for compare_histo. Skipping histogram plot.")
+                return
 
-        model = tf.keras.models.load_model(model_path, compile=False)
+        try:
+            model = tf.keras.models.load_model(model_path, compile=False)
+        except Exception:
+            from .PLACENet_model import PLACENetCore, PLACENetConfig
+            core = PLACENetCore(np.array([]), pad_value=-1)
+            dummy_config = PLACENetConfig(max_sources=labels_test.shape[1])
+            model = core.make_CNN_model(np.array([]), dummy_config, input_shape=data_test.shape[1:])
+            model.load_weights(model_path, skip_mismatch=True)
 
         # Make predictions
         pred = model.predict(data_test[sample_idx : sample_idx + 1], verbose=0)
@@ -2383,6 +2677,12 @@ class PLACENetPlot:
                         if 0 <= i < binx and 0 <= j < biny and 0 <= k < binz:
                             actual_hist[i, j, k] = 1
 
+        # Calculate Total Volume IoU
+        intersection = np.sum((actual_hist > 0) & (prediction_hist > 0))
+        union = np.sum((actual_hist > 0) | (prediction_hist > 0))
+        total_volume_iou = float(intersection / union) if union > 0 else 0.0
+        print(f"Total Volume IoU for sample {sample_idx}: {total_volume_iou:.4f}")
+
         # Create cylindrical surfaces with fixed physical dimensions centered in plot space
         center_x = binx / 2.0
         center_y = biny / 2.0
@@ -2419,14 +2719,15 @@ class PLACENetPlot:
         # Plot comparison
         fig = plt.figure(figsize=(base_width, fig_height), layout="constrained")
         ax1 = fig.add_subplot(111, projection="3d")
+        ax1.set_title(f"Sample {sample_idx} - Total Volume IoU: {total_volume_iou:.4f}", fontsize=14)
         
         # Plot cylindrical surfaces
         ax1.plot_surface(xcyl, ycyl, zcyl, color="y", alpha=0.2)
         ax1.plot_surface(xcyl1, ycyl1, zcyl1, color="y", alpha=0.2)
         
         # Plot voxels
-        ax1.voxels(prediction_hist, facecolor="b", alpha=0.5)
-        ax1.voxels(actual_hist, facecolor="r", alpha=1)
+        ax1.voxels(prediction_hist, facecolor="b", edgecolor="none", alpha=0.5)
+        ax1.voxels(actual_hist, facecolor="r", edgecolor="none", alpha=1)
 
         legend_elements = [
             Patch(facecolor="r", edgecolor="r", label="Actual boxes"),
@@ -2440,11 +2741,12 @@ class PLACENetPlot:
             fontsize=14,
         )
 
-        ax1.set_xlim([0, binx])
-        ax1.set_ylim([0, biny])
+        ax1.set_xlim([20, 80])
+        ax1.set_ylim([20, 80])
         ax1.set_zlim([0, binz])
         
-        max_xy = max(binx, biny)
+        # 80 - 20 = 60 for the new xlim and ylim range
+        max_xy = 60
         ax1.set_box_aspect([max_xy, max_xy, binz * 0.6])
 
         ax1.tick_params(labelsize=14)
@@ -2795,7 +3097,7 @@ class PLACENetPlot:
         # Plot histograms
         if np.any(valid_mask):
             valid_conf = pred_conf_flat[valid_mask]
-            ax.hist(valid_conf, bins=50, alpha=0.6, color='#2ca02c', 
+            ax.hist(valid_conf, bins=50, range=(0.0, 1.0), alpha=0.6, color='#2ca02c', 
                    label=f'Valid slots (n={np.sum(valid_mask)})', edgecolor='black', linewidth=0.5)
             # Add mean and median lines for valid slots
             valid_mean = valid_conf.mean()
@@ -2807,7 +3109,7 @@ class PLACENetPlot:
         
         if np.any(empty_mask):
             empty_conf = pred_conf_flat[empty_mask]
-            ax.hist(empty_conf, bins=50, alpha=0.6, color='#ff7f0e', 
+            ax.hist(empty_conf, bins=50, range=(0.0, 1.0), alpha=0.6, color='#ff7f0e', 
                    label=f'Empty slots (n={np.sum(empty_mask)})', edgecolor='black', linewidth=0.5)
             # Add mean and median lines for empty slots
             empty_mean = empty_conf.mean()
@@ -3006,4 +3308,75 @@ class PLACENetPlot:
         else:
             plt.show()
             plt.close()
+
+    @staticmethod
+    def plot_iou_by_source_count(true_counts, ious, output_path, title="IoU by Source Count"):
+        """Plot IoU distribution grouped by true source count."""
+        if not true_counts or not ious:
+            return
+        
+        fig, ax = plt.subplots(figsize=(8, 6))
+        unique_counts = sorted(list(set(true_counts)))
+        data_to_plot = []
+        labels = []
+        
+        for count in unique_counts:
+            count_ious = [ious[i] for i in range(len(true_counts)) if true_counts[i] == count]
+            if count_ious:
+                data_to_plot.append(count_ious)
+                labels.append(str(count))
+                
+        if data_to_plot:
+            ax.boxplot(data_to_plot, labels=labels, showmeans=True, medianprops={'linestyle': '--', 'color': 'orange'})
+            ax.set_xlabel("True Source Count", fontsize=18)
+            ax.set_ylabel("IoU", fontsize=18)
+            ax.set_title(title, fontsize=20, fontweight='bold')
+            ax.tick_params(axis='both', which='major', labelsize=14)
+            ax.grid(True, linestyle='--', alpha=0.6)
+            ax.set_ylim([0, 1.05])
+            
+            ax.plot([], [], color='green', marker='^', linestyle='None', label='Mean')
+            ax.plot([], [], color='orange', linestyle='--', label='Median')
+            ax.legend(fontsize=14)
+            
+            plt.tight_layout()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(output_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Saved IoU by source count plot to {output_path}")
+
+    @staticmethod
+    def plot_position_error_by_source_count(true_counts, errors, output_path, title="Position Error by Source Count"):
+        """Plot Position Error distribution grouped by true source count."""
+        if not true_counts or not errors:
+            return
+            
+        fig, ax = plt.subplots(figsize=(8, 6))
+        unique_counts = sorted(list(set(true_counts)))
+        data_to_plot = []
+        labels = []
+        
+        for count in unique_counts:
+            count_errors = [errors[i] for i in range(len(true_counts)) if true_counts[i] == count]
+            if count_errors:
+                data_to_plot.append(count_errors)
+                labels.append(str(count))
+                
+        if data_to_plot:
+            ax.boxplot(data_to_plot, labels=labels, showmeans=True, medianprops={'linestyle': '--', 'color': 'orange'})
+            ax.set_xlabel("True Source Count", fontsize=18)
+            ax.set_ylabel("Position Euclidean Error (cm)", fontsize=18)
+            ax.set_title(title, fontsize=20, fontweight='bold')
+            ax.tick_params(axis='both', which='major', labelsize=14)
+            ax.grid(True, linestyle='--', alpha=0.6)
+            
+            ax.plot([], [], color='green', marker='^', linestyle='None', label='Mean')
+            ax.plot([], [], color='orange', linestyle='--', label='Median')
+            ax.legend(fontsize=14)
+            
+            plt.tight_layout()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(output_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Saved position error by source count plot to {output_path}")
 
